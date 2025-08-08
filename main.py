@@ -1,3 +1,35 @@
+"""
+RUN (Windows CMD)
+-----------------
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000
+
+Swagger UI:
+http://127.0.0.1:8000/docs
+
+AUTH in Swagger:
+Click "Authorize" and paste the FULL value (including the word Bearer):
+Bearer 73332fdc9c30b48a918eadc5e9a8c379e902dd1126f2bfb9024c15c6daeaff29
+
+REQUEST SHAPE (grader style)
+----------------------------
+POST /hackrx/run
+Content-Type: application/json
+Accept: application/json
+Authorization: Bearer 73332fdc9c30b48a918eadc5e9a8c379e902dd1126f2bfb9024c15c6daeaff29
+
+{
+  "documents": "<public PDF/DOCX/EML URL>",
+  "questions": ["Q1", "Q2", ...]
+}
+
+RESPONSE
+--------
+{
+  "answers": ["...", "..."]
+}
+"""
+
 import os, io, re, json, time, requests
 from typing import List, Dict, Any, Optional
 import numpy as np
