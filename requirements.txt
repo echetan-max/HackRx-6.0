@@ -3,6 +3,10 @@ uvicorn[standard]==0.30.1
 requests>=2.31.0
 pypdf>=4.2.0
 python-docx>=1.1.0
-sentence-transformers>=3.0.1
-faiss-cpu>=1.8.0
-numpy>=1.26.4
+rank-bm25==0.2.2
+rapidfuzz==3.9.4
+numpy==1.26.4
+
+# Optional (skip on Render for faster boot / fewer wheels)
+# sentence-transformers==3.0.1 ; python_version < "3.12"
+# faiss-cpu==1.8.0 ; python_version < "3.12"
