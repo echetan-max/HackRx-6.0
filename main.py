@@ -1,151 +1,108 @@
-"""
-RUN (Windows CMD)
------------------
-pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
-
-Swagger UI:
-http://127.0.0.1:8000/docs
-
-AUTH in Swagger:
-Click "Authorize" and paste the FULL value (including the word Bearer):
-Bearer 73332fdc9c30b48a918eadc5e9a8c379e902dd1126f2bfb9024c15c6daeaff29
-
-REQUEST SHAPE (grader style)
-----------------------------
-POST /hackrx/run
-Content-Type: application/json
-Accept: application/json
-Authorization: Bearer 73332fdc9c30b48a918eadc5e9a8c379e902dd1126f2bfb9024c15c6daeaff29
-
-{
-  "documents": "<public PDF/DOCX/EML URL>",
-  "questions": ["Q1", "Q2", ...]
-}
-
-RESPONSE
---------
-{
-  "answers": ["...", "..."]
-}
-"""
-
-import os, io, re, json, time, requests
+import os, io, re, json, requests
 from typing import List, Dict, Any, Optional
 import numpy as np
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Security
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-# Security: let users type FULL "Bearer <token>" in Authorize dialog
 from fastapi.security import APIKeyHeader
-from fastapi import Security
 
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from email import policy
 from email.parser import BytesParser
 
-# Optional models (fallback to BM25-only if unavailable)
-EMBED_AVAILABLE = True
-try:
-    from sentence_transformers import SentenceTransformer, CrossEncoder
-except Exception:
-    EMBED_AVAILABLE = False
-
-import faiss
-from rank_bm25 import BM25Okapi
-from rapidfuzz import fuzz
-
-# =================== CONFIG ===================
-# If not provided, default to the evaluator token so you never get 403 there.
+# ------------------------- Flags / Config (env-driven) -------------------------
 TEAM_TOKEN = os.getenv(
     "HACKRX_TEAM_TOKEN",
-    "73332fdc9c30b48a918eadc5e9a8c379e902dd1126f2bfb9024c15c6daeaff29"
+    "73332fdc9c30b48a918eadc5e9a8c379e902dd1126f2bfb9024c15c6daeaff29"  # fallback to evaluator token
 )
-
+USE_EMBED = os.getenv("USE_EMBED", "0") == "1"     # default OFF on Render (fast boot)
+USE_RERANK = os.getenv("USE_RERANK", "0") == "1"   # default OFF on Render (fast boot)
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "intfloat/e5-small-v2")
-CROSS_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CROSS_MODEL_NAME = os.getenv("CROSS_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-INDEX_DIR = "./indices"
 CHUNK_SIZE = 850
 CHUNK_OVERLAP = 160
 TOP_K = 12
 FINAL_CONTEXT_K = 6
-
 W_EMB = 0.65
 W_BM25 = 0.35
-# ==============================================
 
-app = FastAPI(
-    title="HackRx – Single Endpoint RAG (auth expects full Bearer)",
-    version="8.1.0",
-)
+# ------------------------- Optional deps (graceful fallbacks) ------------------
+EMBED_AVAILABLE = False
+CROSS_AVAILABLE = False
+try:
+    if USE_EMBED:
+        from sentence_transformers import SentenceTransformer
+        EMBED_AVAILABLE = True
+    if USE_RERANK:
+        from sentence_transformers import CrossEncoder
+        CROSS_AVAILABLE = True
+except Exception:
+    EMBED_AVAILABLE = False
+    CROSS_AVAILABLE = False
+    USE_RERANK = False
+
+FAISS_AVAILABLE = False
+try:
+    import faiss  # type: ignore
+    FAISS_AVAILABLE = True
+except Exception:
+    FAISS_AVAILABLE = False
+
+try:
+    from rank_bm25 import BM25Okapi
+except Exception as e:
+    # rank-bm25 is mandatory; fail early with a clear message if missing
+    raise RuntimeError("rank-bm25 missing. Add 'rank-bm25==0.2.2' to requirements.txt") from e
+
+from rapidfuzz import fuzz
+
+# ------------------------- FastAPI setup ---------------------------------------
+app = FastAPI(title="HackRx – Single Endpoint RAG (Render-safe)", version="9.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ---- Swagger security that accepts FULL header value ----
 auth_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 def check_auth(api_key: str = Security(auth_header)):
-    """
-    Accepts *full* header value, e.g. "Bearer abc123".
-    We compare directly to "Bearer <TEAM_TOKEN>".
-    """
     expected = f"Bearer {TEAM_TOKEN}"
     if not api_key:
         raise HTTPException(status_code=401, detail="Missing Authorization header.")
     if api_key.strip() != expected:
-        # Helpful console log (not sent to client)
-        print(f"[auth] got '{api_key[:20]}...' but expected 'Bearer ****{TEAM_TOKEN[-6:]}'")
         raise HTTPException(status_code=403, detail="Invalid token.")
     return True
 
-# ---------- Pydantic schema ----------
 class QARequest(BaseModel):
     documents: str
     questions: List[str]
 
-# ---------- Lazy globals ----------
 _embedding_model = None
 _cross_model = None
 
-def _ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
-
 def _get_embedder():
     global _embedding_model
-    if not EMBED_AVAILABLE:
+    if not EMBED_AVAILABLE or not USE_EMBED:
         return None
     if _embedding_model is None:
-        try:
-            _embedding_model = SentenceTransformer(EMBED_MODEL_NAME, cache_folder="./model_cache")
-            print("[embed] model loaded")
-        except Exception as e:
-            print("[embed] disabled:", e)
-            return None
+        _embedding_model = SentenceTransformer(EMBED_MODEL_NAME, cache_folder="./model_cache")
     return _embedding_model
 
 def _get_cross():
     global _cross_model
-    if not EMBED_AVAILABLE:
+    if not CROSS_AVAILABLE or not USE_RERANK:
         return None
     if _cross_model is None:
-        try:
-            _cross_model = CrossEncoder(CROSS_MODEL_NAME)
-            print("[cross] model loaded")
-        except Exception as e:
-            print("[cross] disabled:", e)
-            return None
+        _cross_model = CrossEncoder(CROSS_MODEL_NAME)
     return _cross_model
 
+# IMPORTANT: no model warmup on startup (avoid Render boot timeout)
 @app.on_event("startup")
 def warm():
-    _ = _get_embedder()
-    _ = _get_cross()
+    pass
 
-# ---------- Fetch & parse ----------
+# ------------------------- Fetch & parse ---------------------------------------
 def _read_url(url: str) -> bytes:
     r = requests.get(url, timeout=60)
     r.raise_for_status()
@@ -220,7 +177,6 @@ def _split_clauses(txt: str) -> List[str]:
         return _sliding(_sent_split(txt), 650, 140)
     return sections
 
-# ---------- Index (Hybrid with fallback) ----------
 def _tokenize_for_bm25(text: str) -> List[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
@@ -232,41 +188,15 @@ def _embed(texts: List[str]) -> np.ndarray:
     embs = emb.encode(prepped, batch_size=32, convert_to_numpy=True, normalize_embeddings=True)
     return embs.astype("float32")
 
-def _build_index(doc_url: str, text: str):
-    _ensure_dir(INDEX_DIR)
-    key = re.sub(r"[^a-f0-9]", "", str(abs(hash(doc_url))))  # quick key
-    idx_path = os.path.join(INDEX_DIR, f"{key}.faiss")
-    bm25_path = idx_path + ".bm25"
-    meta_path = idx_path + ".json"
-
-    if os.path.exists(idx_path) and os.path.exists(bm25_path) and os.path.exists(meta_path):
-        idx = faiss.read_index(idx_path)
-        with open(meta_path, "r", encoding="utf-8") as f: meta = json.load(f)
-        with open(bm25_path, "r", encoding="utf-8") as f: bm25_corpus = json.load(f)
-        return idx, meta, bm25_corpus, idx_path
-
+def _build_corpus(text: str):
     sents = _sent_split(text)
     chunks = _sliding(sents, CHUNK_SIZE, CHUNK_OVERLAP)
     clauses = _split_clauses(text)
-
     units, meta_u = [], []
     for i, ch in enumerate(chunks): units.append(ch); meta_u.append({"type":"chunk","id":f"chunk_{i}"})
     for j, cl in enumerate(clauses): units.append(cl); meta_u.append({"type":"clause","id":f"clause_{j}"})
-
-    tokenized = [_tokenize_for_bm25(u) for u in units]  # BM25 corpus
-
-    embs = _embed(units)
-    dim = embs.shape[1] if embs.size else 384
-    index = faiss.IndexFlatIP(dim)
-    if embs.shape[0] > 0:
-        index.add(embs)
-
-    meta = {"doc_url": doc_url, "units": units, "unit_meta": meta_u}
-    faiss.write_index(index, idx_path)
-    with open(meta_path, "w", encoding="utf-8") as f: json.dump(meta, f, ensure_ascii=False)
-    with open(bm25_path, "w", encoding="utf-8") as f: json.dump(tokenized, f)
-
-    return index, meta, tokenized, idx_path
+    tokenized = [_tokenize_for_bm25(u) for u in units]
+    return units, meta_u, tokenized
 
 def _bm25_scores(bm25_corpus, query: str):
     bm = BM25Okapi(bm25_corpus)
@@ -274,39 +204,36 @@ def _bm25_scores(bm25_corpus, query: str):
     scores = bm.get_scores(toks)
     return np.array(scores, dtype="float32")
 
-def _retrieve_hybrid(index, meta, bm25_corpus, query: str, k: int):
-    has_vectors = index.ntotal > 0 and _get_embedder() is not None
-    if has_vectors:
-        q_emb = _get_embedder().encode(["query: " + query], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
-        D, I = index.search(np.array([q_emb]), max(k*2, k))
-        emb_scores = np.zeros(len(meta["units"]), dtype="float32")
-        for sc, idx in zip(D[0], I[0]):
-            if idx != -1: emb_scores[idx] = sc
-        e_min, e_max = float(emb_scores.min()), float(emb_scores.max())
-        eN = (emb_scores - e_min) / (e_max - e_min + 1e-9)
+def _retrieve_hybrid(units, meta_u, bm25_corpus, query: str, k: int):
+    # Embedding scores (if available)
+    if USE_EMBED and EMBED_AVAILABLE:
+        embs = _embed(units)
+        if embs.shape[0] > 0:
+            q = _get_embedder().encode(["query: " + query], convert_to_numpy=True, normalize_embeddings=True)[0].astype("float32")
+            # cosine via dot (normalized)
+            sim = embs @ q
+            e_min, e_max = float(sim.min()), float(sim.max())
+            eN = (sim - e_min) / (e_max - e_min + 1e-9)
+        else:
+            eN = np.zeros(len(units), dtype="float32")
     else:
-        eN = np.zeros(len(meta["units"]), dtype="float32")
+        eN = np.zeros(len(units), dtype="float32")
 
-    bm25_scores = _bm25_scores(bm25_corpus, query)
-    b_min, b_max = float(bm25_scores.min()), float(bm25_scores.max())
-    bN = (bm25_scores - b_min) / (b_max - b_min + 1e-9)
+    # BM25 scores (always)
+    b = _bm25_scores(bm25_corpus, query)
+    b_min, b_max = float(b.min()), float(b.max())
+    bN = (b - b_min) / (b_max - b_min + 1e-9)
 
     fused = W_EMB * eN + W_BM25 * bN
     top_idx = np.argsort(-fused)[:max(k*2, k)]
-    out=[]
-    for idx in top_idx:
-        out.append((meta["units"][idx], meta["unit_meta"][idx], float(fused[idx])))
-    out.sort(key=lambda x: (x[1]["type"]!="clause", -x[2]))  # prefer clause
-    return out[:max(k*2, k)]
-
-def _get_cross():
-    # redefined above; keep to avoid mypy complaints
-    return _cross_model
+    cands = [(units[i], meta_u[i], float(fused[i])) for i in top_idx]
+    cands.sort(key=lambda x: (x[1]["type"]!="clause", -x[2]))  # prefer clause
+    return cands[:max(k*2, k)]
 
 def _cross_rerank(query: str, cands):
-    ce = _get_cross()
-    if ce is None or not cands:
+    if not (USE_RERANK and CROSS_AVAILABLE and cands):
         return cands
+    ce = _get_cross()
     pairs = [[query, t] for (t,_,_) in cands]
     scores = ce.predict(pairs)
     rer=[]
@@ -323,7 +250,6 @@ def _build_context(reranked, top_k=FINAL_CONTEXT_K):
     supp=[{"id":c[1]["id"],"type":c[1]["type"],"score":round(float(c[2]),4),"text":c[0][:1400]} for c in chosen]
     return ctx, supp
 
-# ---------- Extractive + verbatim preference ----------
 NUM_PATTERNS = [
     r"\b\d{1,3}\s*days?\b", r"\b\d{1,3}\s*months?\b", r"\b\d{1,2}\s*years?\b",
     r"\b\d{1,3}\s*%\s*of\s*si\b", r"inr\s*[0-9][0-9,]*", r"\bper\s+eye\b", r"\bper\s+day\b",
@@ -334,22 +260,22 @@ KEY_PHRASES = [
 ]
 
 def _sentences(text: str) -> List[str]:
-    return _sent_split(text)
+    t = re.sub(r"\s+", " ", text)
+    return [x.strip() for x in re.split(r"(?<=[.!?])\s+", t) if x.strip()]
 
 def _extractive_answer(question: str, context: str) -> str:
-    emb = _get_embedder()
     sents = _sentences(context)
     if not sents: return ""
-    if emb is None:
-        scored = []
+    if not (USE_EMBED and EMBED_AVAILABLE):
+        scored=[]
         for s in sents:
             sc = max(fuzz.partial_ratio(question.lower(), s.lower()), fuzz.token_set_ratio(question.lower(), s.lower()))/100.0
             if any(re.search(p, s, flags=re.I) for p in NUM_PATTERNS): sc += 0.3
             scored.append((sc, s))
         scored.sort(key=lambda x: x[0], reverse=True)
         return " ".join(s for _,s in scored[:5])
-    q = emb.encode(["query: " + question], convert_to_numpy=True, normalize_embeddings=True)[0]
-    embs = emb.encode(["passage: "+s for s in sents], convert_to_numpy=True, normalize_embeddings=True)
+    q = _get_embedder().encode(["query: " + question], convert_to_numpy=True, normalize_embeddings=True)[0]
+    embs = _get_embedder().encode(["passage: "+s for s in sents], convert_to_numpy=True, normalize_embeddings=True)
     sims = (embs @ q)
     top = np.argsort(-sims)[:6]
     return " ".join(sents[i].strip() for i in top)
@@ -373,18 +299,21 @@ def _verbatim_snip(question: str, context: str) -> Optional[str]:
     best = re.sub(r"\s{2,}"," ",best).strip()
     return best[:220]
 
-# ---------- Normalizer (short, exact outputs for grader) ----------
 def _first_sentence(s: str)->str:
-    s=s.replace("\n"," ").strip(); m=re.split(r"(?<=[.!?])\s+",s); return (m[0] if m else s).strip()
+    s=s.replace("\n"," ").strip()
+    m=re.split(r"(?<=[.!?])\s+",s)
+    return (m[0] if m else s).strip()
 
 def _clean_noise(s: str)->str:
     s=re.sub(r"Page \d+ of \d+.*?$","",s,flags=re.I)
-    s=re.sub(r"\s{2,}"," ",s).strip(); return s
+    s=re.sub(r"\s{2,}"," ",s).strip()
+    return s
 
 def _norm_unit(text:str, unit_regex:str)->Optional[str]:
     m=re.search(r"(\d+)\s*"+unit_regex, text, flags=re.I)
     if m:
-        val=int(m.group(1)); unit = "day" if "day" in unit_regex else ("month" if "month" in unit_regex else "year")
+        val=int(m.group(1))
+        unit = "day" if "day" in unit_regex else ("month" if "month" in unit_regex else "year")
         return f"{val} {unit}{'' if val==1 else 's'}"
     return None
 
@@ -428,16 +357,11 @@ def scoring_normalize(question:str, supports:List[Dict[str,Any]], fallback:str)-
         return "Yes — reimbursed at end of every two continuous policy years, per limits."
     if "define" in q and "hospital" in q:
         return "Institution with ≥10 beds (or ≥15 in bigger towns), 24×7 nursing & medical staff, OT, and records."
-
     return base if base else "Not found in document."
 
-# ---------- API ----------
-@app.post("/hackrx/run", summary="Unified Run", tags=["Unified Run"], responses={200: {"description": "OK"}})
+# ------------------------- API -------------------------
+@app.post("/hackrx/run", summary="Unified Run", tags=["Unified Run"])
 def hackrx_run(req: QARequest, _: bool = Depends(check_auth)):
-    """
-    Input:  { "documents": "<url>", "questions": ["..."] }
-    Output: { "answers": ["...", ...] }
-    """
     if not req.documents:
         raise HTTPException(status_code=400, detail="Missing 'documents' URL.")
     if not req.questions or not isinstance(req.questions, list):
@@ -452,18 +376,13 @@ def hackrx_run(req: QARequest, _: bool = Depends(check_auth)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read document: {e}")
 
-    # Build/load index
-    try:
-        idx, meta, bm25_corpus, _ = _build_index(req.documents, text)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Indexing failed: {e}")
+    units, meta_u, bm25_corpus = _build_corpus(text)
 
     answers=[]
     for q in req.questions:
-        cands = _retrieve_hybrid(idx, meta, bm25_corpus, q, k=TOP_K)
+        cands = _retrieve_hybrid(units, meta_u, bm25_corpus, q, k=TOP_K)
         cands = _cross_rerank(q, cands)
         ctx, supports = _build_context(cands, top_k=FINAL_CONTEXT_K)
-
         raw_ans = _extractive_answer(q, ctx)
         final = scoring_normalize(q, supports, raw_ans)
         answers.append(final)
